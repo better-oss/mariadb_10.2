@@ -4004,8 +4004,7 @@ public:
                                    const char *path,
                                    const char *db,
                                    const char *table_name,
-                                   bool open_in_engine,
-                                   bool *created);
+                                   bool open_in_engine);
 
   TABLE *find_temporary_table(const char *db, const char *table_name);
   TABLE *find_temporary_table(const TABLE_LIST *tl);

@@ -73,7 +73,6 @@ void THD::reset_temporary_tables()
   @param db   [IN]                    Schema name
   @param table_name [IN]              Table name
   @param open_in_engine [IN]          Whether open table in SE
-  @param created [OUT]                Whether table was created?
 
 
   @return Success                     A pointer to table object
@@ -84,19 +83,15 @@ TABLE *THD::create_and_open_tmp_table(handlerton *hton,
                                       const char *path,
                                       const char *db,
                                       const char *table_name,
-                                      bool open_in_engine,
-                                      bool *created)
+                                      bool open_in_engine)
 {
   DBUG_ENTER("THD::create_and_open_tmp_table");
 
   TMP_TABLE_SHARE *share;
   TABLE *table= NULL;
 
-  *created= false;
-
   if ((share= create_temporary_table(hton, frm, path, db, table_name)))
   {
-    *created= true;
     table= open_temporary_table(share, table_name, open_in_engine);
   }
 

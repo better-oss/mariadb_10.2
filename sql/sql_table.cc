@@ -4817,18 +4817,12 @@ int create_table_impl(THD *thd,
   create_info->table= 0;
   if (!frm_only && create_info->tmp_table())
   {
-    bool created;
-
     TABLE *table= thd->create_and_open_tmp_table(create_info->db_type, frm,
-                                                 path, db, table_name, true,
-                                                 &created);
+                                                 path, db, table_name, true);
 
     if (!table)
     {
-      if (created)
-      {
-        (void) thd->rm_temporary_table(create_info->db_type, path);
-      }
+      (void) thd->rm_temporary_table(create_info->db_type, path);
       goto err;
     }
 
@@ -8740,9 +8734,6 @@ bool mysql_alter_table(THD *thd,char *new_db, char *new_name,
   /* Remember that we have not created table in storage engine yet. */
   bool no_ha_table= true;
 
-  /* Whether the temporary table was created. */
-  bool created= false;
-
   if (alter_info->requested_algorithm != Alter_info::ALTER_TABLE_ALGORITHM_COPY)
   {
     Alter_inplace_info ha_alter_info(create_info, alter_info,
@@ -8780,19 +8771,12 @@ bool mysql_alter_table(THD *thd,char *new_db, char *new_name,
     // We assume that the table is non-temporary.
     DBUG_ASSERT(!table->s->tmp_table);
 
-    altered_table=
-      thd->create_and_open_tmp_table(new_db_type, &frm,
-                                     alter_ctx.get_tmp_path(),
-                                     alter_ctx.new_db, alter_ctx.tmp_name,
-                                     false, &created);
-    if (!altered_table)
-    {
-      if (created)
-      {
-        (void) thd->rm_temporary_table(new_db_type, alter_ctx.get_tmp_path());
-      }
+    if (!(altered_table=
+          thd->create_and_open_tmp_table(new_db_type, &frm,
+                                         alter_ctx.get_tmp_path(),
+                                         alter_ctx.new_db, alter_ctx.tmp_name,
+                                         false)))
       goto err_new_table_cleanup;
-    }
 
     /* Set markers for fields in TABLE object for altered table. */
     update_altered_table(ha_alter_info, altered_table);
@@ -8948,13 +8932,9 @@ bool mysql_alter_table(THD *thd,char *new_db, char *new_name,
       thd->create_and_open_tmp_table(new_db_type, &frm,
                                      alter_ctx.get_tmp_path(),
                                      alter_ctx.new_db, alter_ctx.tmp_name,
-                                     true, &created);
+                                     true);
     if (!tmp_table)
     {
-      if (created)
-      {
-        (void) thd->rm_temporary_table(new_db_type, alter_ctx.get_tmp_path());
-      }
       goto err_new_table_cleanup;
     }
   }
@@ -8984,11 +8964,7 @@ bool mysql_alter_table(THD *thd,char *new_db, char *new_name,
       thd->create_and_open_tmp_table(new_db_type, &frm,
                                      alter_ctx.get_tmp_path(),
                                      alter_ctx.new_db, alter_ctx.tmp_name,
-                                     true, &created);
-    if (!new_table && created)
-    {
-      (void) thd->rm_temporary_table(new_db_type, alter_ctx.get_tmp_path());
-    }
+                                     true);
   }
   if (!new_table)
     goto err_new_table_cleanup;
