@@ -4915,7 +4915,12 @@ err_during_init:
     TODO: see if we can do this conditionally in next_event() instead
     to avoid unneeded position re-init
   */
-  thd->reset_temporary_tables();
+
+  /*
+    We only reset THD::temporary_tables to 0 here and not free it, as this
+    could be used by slave through Relay_log_info::save_temporary_tables.
+  */
+  thd->temporary_tables= 0;
   THD_CHECK_SENTRY(thd);
   rli->sql_driver_thd= 0;
   mysql_mutex_lock(&LOCK_thread_count);

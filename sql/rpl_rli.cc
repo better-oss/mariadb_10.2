@@ -53,6 +53,7 @@ Relay_log_info::Relay_log_info(bool is_slave_recovery)
    no_storage(FALSE), replicate_same_server_id(::replicate_same_server_id),
    info_fd(-1), cur_log_fd(-1), relay_log(&sync_relaylog_period),
    sync_counter(0), is_relay_log_recovery(is_slave_recovery),
+   save_temporary_tables(0),
    mi(0), inuse_relaylog_list(0), last_inuse_relaylog(0),
    cur_log_old_open_count(0), group_relay_log_pos(0), 
    event_relay_log_pos(0),
@@ -94,7 +95,6 @@ Relay_log_info::Relay_log_info(bool is_slave_recovery)
   mysql_cond_init(key_relay_log_info_stop_cond, &stop_cond, NULL);
   mysql_cond_init(key_relay_log_info_log_space_cond, &log_space_cond, NULL);
   relay_log.init_pthread_objects();
-  save_temporary_tables.empty();
   DBUG_VOID_RETURN;
 }
 
@@ -1066,7 +1066,13 @@ void Relay_log_info::close_temporary_tables()
   TMP_TABLE_SHARE *share;
   TABLE *table;
 
-  while ((share= save_temporary_tables.pop_front()))
+  if (!save_temporary_tables)
+  {
+    /* There are no temporary tables. */
+    DBUG_VOID_RETURN;
+  }
+
+  while ((share= save_temporary_tables->pop_front()))
   {
     /*
       Iterate over the list of tables for this TABLE_SHARE and close them.
@@ -1096,7 +1102,12 @@ void Relay_log_info::close_temporary_tables()
     my_free(share);
   }
 
-  save_temporary_tables.empty();
+  /* By now, there mustn't be any elements left in the list. */
+  DBUG_ASSERT(save_temporary_tables->is_empty());
+
+  my_free(save_temporary_tables);
+  save_temporary_tables= NULL;
+  slave_open_temp_tables= 0;
 
   DBUG_VOID_RETURN;
 }

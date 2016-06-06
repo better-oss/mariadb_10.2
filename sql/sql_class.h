@@ -1338,7 +1338,7 @@ public:
     and internal temporary tables, created, e.g., to resolve a SELECT,
     or for an intermediate table used in ALTER.
   */
-  All_tmp_tables_list temporary_tables;
+  All_tmp_tables_list *temporary_tables;
 
   /*
     Derived tables.
@@ -1423,13 +1423,13 @@ public:
   void reset_open_tables_state(THD *thd)
   {
     open_tables= 0;
+    temporary_tables= 0;
     derived_tables= 0;
     extra_lock= 0;
     lock= 0;
     locked_tables_mode= LTM_NONE;
     state_flags= 0U;
     m_reprepare_observer= NULL;
-    temporary_tables.empty();
   }
 };
 

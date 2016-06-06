@@ -42,8 +42,8 @@
 bool THD::has_temporary_tables()
 {
   DBUG_ENTER("THD::has_temporary_tables");
-  bool result= temporary_tables.is_empty();
-  DBUG_RETURN(!result);
+  bool result= (temporary_tables && !temporary_tables->is_empty());
+  DBUG_RETURN(result);
 }
 
 
@@ -55,7 +55,11 @@ bool THD::has_temporary_tables()
 void THD::reset_temporary_tables()
 {
   DBUG_ENTER("THD::reset_temporary_tables");
-  temporary_tables.empty();
+  if (temporary_tables)
+  {
+    DBUG_ASSERT(temporary_tables->is_empty());
+    temporary_tables= NULL;
+  }
   DBUG_VOID_RETURN;
 }
 
@@ -149,6 +153,12 @@ TABLE *THD::find_temporary_table(const char *db,
 TABLE *THD::find_temporary_table(const TABLE_LIST *tl)
 {
   DBUG_ENTER("THD::find_temporary_table");
+
+  if (!(has_temporary_tables() || (rgi_slave && has_slave_temporary_tables())))
+  {
+    DBUG_RETURN(NULL);
+  }
+
   TABLE *table= find_temporary_table(tl->get_db_name(), tl->get_table_name());
   DBUG_RETURN(table);
 }
@@ -174,9 +184,14 @@ TMP_TABLE_SHARE *THD::find_tmp_table_share_w_base_key(const char *key,
   TMP_TABLE_SHARE *result= NULL;
   bool locked;
 
+  if (!(has_temporary_tables() || (rgi_slave && has_slave_temporary_tables())))
+  {
+    DBUG_RETURN(NULL);
+  }
+
   locked= lock_temporary_tables();
 
-  All_tmp_tables_list::Iterator it(temporary_tables);
+  All_tmp_tables_list::Iterator it(*temporary_tables);
   while ((share= it++))
   {
     if ((share->table_cache_key.length - TMP_TABLE_KEY_EXTRA) == key_length
@@ -253,9 +268,14 @@ TMP_TABLE_SHARE *THD::find_tmp_table_share(const char *key, uint key_length)
   TMP_TABLE_SHARE *result= NULL;
   bool locked;
 
+  if (!(has_temporary_tables() || (rgi_slave && has_slave_temporary_tables())))
+  {
+    DBUG_RETURN(NULL);
+  }
+
   locked= lock_temporary_tables();
 
-  All_tmp_tables_list::Iterator it(temporary_tables);
+  All_tmp_tables_list::Iterator it(*temporary_tables);
   while ((share= it++))
   {
     if (share->table_cache_key.length == key_length &&
@@ -309,6 +329,16 @@ bool THD::open_temporary_table(TABLE_LIST *tl)
 
   TMP_TABLE_SHARE *share;
   TABLE *table= NULL;
+
+  /*
+    Since temporary tables are not safe for parallel replication, lets
+    wait for the prior commits in case the table is found to be in use.
+  */
+  if (rgi_slave &&
+      rgi_slave->is_parallel_exec &&
+      find_temporary_table(tl) &&
+      wait_for_prior_commit())
+    DBUG_RETURN(true);
 
   /*
     Code in open_table() assumes that TABLE_LIST::table can be non-zero only
@@ -375,7 +405,6 @@ bool THD::open_temporary_table(TABLE_LIST *tl)
     in any case rather fragile.
   */
   if (rgi_slave &&
-      !rgi_slave->rli->save_temporary_tables.is_empty() &&
       rgi_slave->is_parallel_exec &&
       wait_for_prior_commit())
     DBUG_RETURN(true);
@@ -463,10 +492,16 @@ bool THD::close_temporary_tables()
 
   bool error= false;
 
-  if (temporary_tables.is_empty())
+  if (!has_temporary_tables())
   {
+    if (temporary_tables)
+    {
+      my_free(temporary_tables);
+      temporary_tables= NULL;
+    }
     DBUG_RETURN(false);
   }
+
   DBUG_ASSERT(!rgi_slave);
 
   /*
@@ -477,7 +512,7 @@ bool THD::close_temporary_tables()
   mysql_ha_rm_temporary_tables(this);
 
   /* Close all open temporary tables. */
-  All_tmp_tables_list::Iterator it(temporary_tables);
+  All_tmp_tables_list::Iterator it(*temporary_tables);
   while ((share= it++))
   {
     /* Traverse the table list. */
@@ -494,12 +529,17 @@ bool THD::close_temporary_tables()
   }
   else
   {
-    while ((share= temporary_tables.pop_front()))
+    while ((share= temporary_tables->pop_front()))
     {
       free_tmp_table_share(share, true);
     }
   }
-  reset_temporary_tables();
+
+  /* By now, there mustn't be any elements left in the list. */
+  DBUG_ASSERT(temporary_tables->is_empty());
+
+  my_free(temporary_tables);
+  temporary_tables= NULL;
 
   DBUG_RETURN(error);
 }
@@ -610,8 +650,10 @@ bool THD::drop_temporary_table(TABLE *table,
     free_temporary_table(tab);
   }
 
+  DBUG_ASSERT(temporary_tables);
+
   /* Remove the TABLE_SHARE from the list of temporary tables. */
-  temporary_tables.remove(share);
+  temporary_tables->remove(share);
 
   /* Free the TABLE_SHARE and/or delete the files. */
   free_tmp_table_share(share, delete_table);
@@ -687,9 +729,14 @@ void THD::mark_tmp_tables_as_free_for_reuse()
     DBUG_VOID_RETURN;
   }
 
+  if (!(has_temporary_tables() || (rgi_slave && has_slave_temporary_tables())))
+  {
+    DBUG_VOID_RETURN;
+  }
+
   locked= lock_temporary_tables();
 
-  All_tmp_tables_list::Iterator it(temporary_tables);
+  All_tmp_tables_list::Iterator it(*temporary_tables);
   while ((share= it++))
   {
     All_share_tables_list::Iterator tables_it(share->all_tmp_tables);
@@ -706,6 +753,15 @@ void THD::mark_tmp_tables_as_free_for_reuse()
   {
     DBUG_ASSERT(m_tmp_tables_locked);
     unlock_temporary_tables();
+  }
+
+  if (rgi_slave)
+  {
+    /*
+      Temporary tables are shared with other by sql execution threads.
+      As a safety measure, clear the pointer to the common area.
+    */
+    temporary_tables= NULL;
   }
 
   DBUG_VOID_RETURN;
@@ -772,8 +828,9 @@ TMP_TABLE_SHARE *THD::save_tmp_table_share(TABLE *table)
   TMP_TABLE_SHARE *share;
 
   lock_temporary_tables();
+  DBUG_ASSERT(temporary_tables);
   share= tmp_table_share(table);
-  temporary_tables.remove(share);
+  temporary_tables->remove(share);
   unlock_temporary_tables();
 
   DBUG_RETURN(share);
@@ -792,7 +849,8 @@ void THD::restore_tmp_table_share(TMP_TABLE_SHARE *share)
   DBUG_ENTER("THD::restore_tmp_table_share");
 
   lock_temporary_tables();
-  temporary_tables.push_front(share);
+  DBUG_ASSERT(temporary_tables);
+  temporary_tables->push_front(share);
   unlock_temporary_tables();
 
   DBUG_VOID_RETURN;
@@ -807,12 +865,13 @@ void THD::restore_tmp_table_share(TMP_TABLE_SHARE *share)
   @return false                       Temporary tables exist
           true                        No temporary table exist
 */
-bool THD::has_slave_temporary_tables()
+inline bool THD::has_slave_temporary_tables()
 {
   DBUG_ENTER("THD::has_slave_temporary_tables");
   DBUG_ASSERT(rgi_slave);
-  bool result= rgi_slave->rli->save_temporary_tables.is_empty();
-  DBUG_RETURN(!result);
+  bool result= (rgi_slave->rli->save_temporary_tables &&
+                !rgi_slave->rli->save_temporary_tables->is_empty());
+  DBUG_RETURN(result);
 }
 
 
@@ -883,7 +942,6 @@ TMP_TABLE_SHARE *THD::create_temporary_table(handlerton *hton,
 
   /* Temporary tables are not safe for parallel replication. */
   if (rgi_slave &&
-      !rgi_slave->rli->save_temporary_tables.is_empty() &&
       rgi_slave->is_parallel_exec &&
       wait_for_prior_commit())
     DBUG_RETURN(NULL);
@@ -933,14 +991,32 @@ TMP_TABLE_SHARE *THD::create_temporary_table(handlerton *hton,
   /* Initialize the all_tmp_tables list. */
   share->all_tmp_tables.empty();
 
+  /*
+    We need to alloc & initialize temporary_tables if this happens
+    to be the very first temporary table.
+  */
+  if (!temporary_tables)
+  {
+    if ((temporary_tables=
+         (All_tmp_tables_list *) my_malloc(sizeof(All_tmp_tables_list),
+                                           MYF(MY_WME))))
+    {
+      temporary_tables->empty();
+    }
+    else
+    {
+      DBUG_RETURN(NULL);                        /* Out of memory */
+    }
+  }
+
+  /* Add share to the head of the temporary table share list. */
+  temporary_tables->push_front(share);
+
   if (locked)
   {
     DBUG_ASSERT(m_tmp_tables_locked);
     unlock_temporary_tables();
   }
-
-  /* Add share to the head of the temporary table share list. */
-  temporary_tables.push_front(share);
 
   DBUG_RETURN(share);
 }
@@ -968,7 +1044,7 @@ TABLE *THD::find_temporary_table(const char *key, uint key_length,
 
   locked= lock_temporary_tables();
 
-  All_tmp_tables_list::Iterator it(temporary_tables);
+  All_tmp_tables_list::Iterator it(*temporary_tables);
   while ((share= it++))
   {
     if (share->table_cache_key.length == key_length &&
@@ -1142,7 +1218,6 @@ bool THD::use_temporary_table(TABLE *table, TABLE **out_table)
     in any case rather fragile.
   */
   if (rgi_slave &&
-      !rgi_slave->rli->save_temporary_tables.is_empty() &&
       rgi_slave->is_parallel_exec &&
       wait_for_prior_commit())
     DBUG_RETURN(true);
@@ -1179,9 +1254,11 @@ void THD::close_temporary_table(TABLE *table)
   closefrm(table, false);
   my_free(table);
 
-  /* Decrement Slave_open_temp_table_definitions status variable count. */
   if (rgi_slave)
   {
+    /* Natural invariant of temporary_tables */
+    DBUG_ASSERT(slave_open_temp_tables || !temporary_tables);
+    /* Decrement Slave_open_temp_table_definitions status variable count. */
     thread_safe_decrement32(&slave_open_temp_tables);
   }
 
@@ -1220,8 +1297,8 @@ bool THD::log_events_and_free_tmp_shares()
     Insertion sort of temporary tables by pseudo_thread_id to build ordered
     list of sublists of equal pseudo_thread_id.
   */
-  All_tmp_tables_list::Iterator it_sorted(temporary_tables);
-  All_tmp_tables_list::Iterator it_unsorted(temporary_tables);
+  All_tmp_tables_list::Iterator it_sorted(*temporary_tables);
+  All_tmp_tables_list::Iterator it_unsorted(*temporary_tables);
   uint sorted_count= 0;
   while((share= it_unsorted++))
   {
@@ -1242,15 +1319,15 @@ bool THD::log_events_and_free_tmp_shares()
             Insert this share before the current element in
             the sorted part of the list.
           */
-          temporary_tables.remove(share);
+          temporary_tables->remove(share);
 
           if (prev_sorted)
           {
-            temporary_tables.insert_after(prev_sorted, share);
+            temporary_tables->insert_after(prev_sorted, share);
           }
           else
           {
-            temporary_tables.push_front(share);
+            temporary_tables->push_front(share);
           }
           break;
         }
@@ -1274,7 +1351,7 @@ bool THD::log_events_and_free_tmp_shares()
   /*
     Scan sorted temporary tables to generate sequence of DROP.
   */
-  share= temporary_tables.pop_front();
+  share= temporary_tables->pop_front();
   while (share)
   {
     if (IS_USER_TABLE(share))
@@ -1306,7 +1383,7 @@ bool THD::log_events_and_free_tmp_shares()
            share->db.length == db.length() &&
            memcmp(share->db.str, db.ptr(), db.length()) == 0;
            /* Get the next TABLE_SHARE in the list. */
-           share= temporary_tables.pop_front())
+           share= temporary_tables->pop_front())
       {
         /*
           We are going to add ` around the table names and possible more
@@ -1359,7 +1436,7 @@ bool THD::log_events_and_free_tmp_shares()
     {
       free_tmp_table_share(share, true);
       /* Get the next TABLE_SHARE in the list. */
-      share= temporary_tables.pop_front();
+      share= temporary_tables->pop_front();
     }
   }
 
@@ -1470,11 +1547,6 @@ void THD::unlock_temporary_tables()
     rgi_slave->rli->save_temporary_tables= temporary_tables;
     mysql_mutex_unlock(&rgi_slave->rli->data_lock);
     m_tmp_tables_locked= false;
-    /*
-      Temporary tables are shared with other by sql execution threads.
-      As a safety measure, clear the pointer to the common area.
-    */
-    reset_temporary_tables();
   }
 
   DBUG_VOID_RETURN;
